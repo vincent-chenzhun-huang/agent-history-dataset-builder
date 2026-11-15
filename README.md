@@ -1,4 +1,4 @@
-# Codex Attempt Dataset
+# Agent History Dataset Builder
 
 Build a human-verified dataset of failed coding-agent attempts, grouped by GitHub pull request. The dataset preserves the original task prompt, the implementation, the evidence that it fell short, and a failure label.
 
