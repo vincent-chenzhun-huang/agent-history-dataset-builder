@@ -1,0 +1,7 @@
+/data/
+*.csv
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.jsonl
+*.jsonl.zst
