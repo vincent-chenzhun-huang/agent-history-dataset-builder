@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-history-dataset-builder"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[project.scripts]
+scan-history = "agent_history_dataset_builder.cli:scan_main"
+verify-attempt = "agent_history_dataset_builder.cli:verify_main"
+dataset-review-hook = "agent_history_dataset_builder.hook:main"
+
+[tool.setuptools.packages.find]
+include = ["agent_history_dataset_builder*"]
