@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
+from .config import EVIDENCE_KINDS, Limits
 from .prs import WorkSpan
 from .transcripts import Event, codex_thread_fields
 
@@ -22,7 +24,8 @@ LABELS = (
     "missing_cross_system_dependency_knowledge",
 )
 _IMPLEMENTATION = {"assistant_message", "command_execution", "file_change", "tool_result", "mcp_tool_call"}
-_EVIDENCE = _IMPLEMENTATION | {"user_message"}
+_EVIDENCE = EVIDENCE_KINDS
+_EVIDENCE_PRIORITY = {"user_message": 3, "file_change": 2, "assistant_message": 1}
 _CONTEXT_LABELS = {
     "code_smell_precedent",
     "missing_local_repo_context", "missing_cross_system_dependency_knowledge",
@@ -31,6 +34,14 @@ _CONTEXT_LABELS = {
 
 class ModelError(ValueError):
     """An analyzer did not return usable results."""
+
+
+class ModelTimeout(ModelError):
+    """The model exhausted its configured time budget."""
+
+
+class ModelInputTooLarge(ModelError):
+    """The complete native prompt exceeds the transport limit."""
 
 
 class Model(Protocol):
@@ -92,27 +103,75 @@ def _quote_in(event: Event, quote: object) -> bool:
     return contains(json.loads(_content(event)))
 
 
-def _block_data(events: list[Event], limit: int = 100_000) -> list[dict]:
-    data = []
+def _block_data(
+    events: list[Event], limit: int = Limits.context_chars, *, event_chars: int = Limits.event_chars,
+    max_events: int = Limits.max_events, gaps: list[str] | None = None, preferred: frozenset[str] = frozenset(),
+    local_refs: frozenset[str] | None = None,
+) -> list[dict]:
+    records = []
+    maximum = min(event_chars, max(1, limit // 2))
+    clipped_count = 0
     for event in events:
         content = _content(event)
-        # Preserve both ends of large results and tell the model what was clipped.
-        maximum = min(6000, limit // 2)
         clipped = len(content) > maximum
         if clipped:
-            content = content[:maximum // 2] + "\n[preview clipped]\n" + content[-maximum // 2:]
-        data.append({
+            clipped_count += 1
+            tail = (maximum - 1) // 2
+            content = content[:maximum - 1 - tail] + "…" + (content[-tail:] if tail else "")
+        record = {
             "id": ref(event), "kind": event.kind, "text": content,
             "truncated": event.output_truncated or clipped,
-        })
-    remaining = limit
+        }
+        if local_refs is not None and record["id"] not in local_refs:
+            record["context_only"] = True
+        records.append(record)
+    remaining = max(0, limit - 2)
     selected = set()
-    for index in sorted(range(len(data)), key=lambda i: (data[i]["kind"] == "user_message", i), reverse=True):
-        size = len(data[index]["text"]) + 100
-        if size <= remaining:
+    ranked = sorted(
+        range(len(records)),
+        key=lambda i: (records[i]["id"] in preferred, _EVIDENCE_PRIORITY.get(events[i].kind, 0), i),
+        reverse=True,
+    )
+    for index in ranked:
+        size = len(json.dumps(records[index], ensure_ascii=False)) + 2
+        if len(selected) < max_events and size <= remaining:
             selected.add(index)
             remaining -= size
-    return [item for index, item in enumerate(data) if index in selected]
+    if gaps is not None:
+        if clipped_count:
+            gaps.append(f"Event text budget clipped {clipped_count} evidence event(s)")
+        if len(selected) < len(records):
+            gaps.append(f"Context budget omitted {len(records) - len(selected)} evidence event(s)")
+    return [record for index, record in enumerate(records) if index in selected]
+
+
+def _previous_evidence(
+    span: WorkSpan, before: int, limits: Limits, gaps: list[str], current: list[Event],
+) -> list[Event]:
+    earlier = [*span.earlier_requests,
+               *(event for event in span.events if event.position < before and event.kind in _EVIDENCE)]
+    opening = span.earlier_requests[0] if span.earlier_requests else None
+    terms = set(re.findall(r"[\w-]{5,}", " ".join(event.prompt or "" for event in current).lower()))
+    kept = []
+    counts: dict[str, int] = {}
+    ranked = sorted(
+        reversed(earlier),
+        key=lambda event: (
+            event is opening, _EVIDENCE_PRIORITY.get(event.kind, 0),
+            len(terms.intersection(re.findall(r"[\w-]{5,}", (event.prompt or "").lower()))),
+        ),
+        reverse=True,
+    )
+    for event in ranked:
+        if len(kept) >= limits.lookback_events:
+            break
+        count = counts.get(event.kind, 0)
+        if count < limits.lookback_by_kind.get(event.kind, limits.lookback_events):
+            counts[event.kind] = count + 1
+            kept.append(event)
+    if len(kept) < len(earlier):
+        gaps.append(f"Lookback budget omitted {len(earlier) - len(kept)} earlier evidence event(s)")
+    return sorted(kept, key=lambda event: event.position)
 
 
 def blocks(events: tuple[Event, ...]) -> list[list[Event]]:
@@ -125,9 +184,9 @@ def blocks(events: tuple[Event, ...]) -> list[list[Event]]:
     return result
 
 
-def _batches(source: list[list[Event]]):
-    for start in range(0, len(source), 4):
-        current = [event for block in source[start:start + 4] for event in block]
+def _batches(source: list[list[Event]], size: int):
+    for start in range(0, len(source), size):
+        current = [event for block in source[start:start + size] for event in block]
         context = source[start - 1] if start else []
         yield current, context
 
@@ -302,7 +361,14 @@ def validate_failure(
         "task_id": task.id,
         "pr_url": span.pr.url,
         "pr_link_evidence": json.dumps([
-            evidence_ref(reason, event, pr_id=span.pr.identity) for reason, event in span.basis
+            evidence_ref(
+                item.reason, item.event, pr_id=span.pr.identity,
+                **({"branch": item.branch} if item.branch else {}),
+                **({"adapter": item.adapter} if item.adapter else {}),
+                **({"remote_branch": item.remote_branch} if item.remote_branch else {}),
+                **({"branch_mapping": asdict(item.branch_mapping)} if item.branch_mapping else {}),
+            )
+            for item in span.basis
         ], ensure_ascii=False),
         "task_description": task.description,
         "original_prompt": task.request.prompt,
@@ -322,55 +388,112 @@ def validate_failure(
     }
 
 
-def analyze_span(span: WorkSpan, model: Model, prior: list[Task]) -> Analysis:
+def analyze_span(span: WorkSpan, model: Model, prior: list[Task], limits: Limits = Limits()) -> Analysis:
     if span.pr is None:
         return Analysis([], [], [])
     tasks = {task.id: task for task in prior}
     rows, issues = [], []
-    batches = list(_batches(blocks(span.events)))
-    for current, context in batches:
-        nearby = sorted(tasks.values(), key=lambda task: _task_rank(task, current), reverse=True)[:16]
-        sources = [*context, *current]
-        for task in nearby:
-            if task.request not in sources:
-                sources.insert(0, task.request)
-        event_map = {ref(event): event for event in sources}
-        data = {
-            "current": [ref(event) for event in current],
-            "events": _block_data(sources),
-            "existing_tasks": [task.model_data() for task in nearby],
-        }
-        decisions = _list_of_objects(model.decide("tasks", data), "decisions")
-        issues.extend(apply_task_decisions(decisions, event_map, span.pr.identity, tasks))
+    batches = list(_batches(blocks(span.events), limits.batch_size))
+    local_refs = frozenset(ref(event) for event in span.events if event.kind in _EVIDENCE)
 
-    for current, context in batches:
-        nearby = sorted(tasks.values(), key=lambda task: _task_rank(task, current), reverse=True)[:16]
-        if not nearby:
-            continue
-        sources = [*context, *current]
-        # Later feedback can refer to an attempt several blocks earlier.
-        first_position = sources[0].position
-        earlier = [event for event in span.events if event.position < first_position and event.kind in _EVIDENCE]
-        sources = [*earlier[-48:], *sources]
-        for task in nearby:
-            if task.request not in sources:
-                sources.insert(0, task.request)
-        event_map = {ref(event): event for event in sources}
-        data = {
-            "current": [ref(event) for event in current],
-            "events": _block_data(sources),
-            "existing_tasks": [task.model_data() for task in nearby],
-            "labels": LABELS,
-        }
-        for candidate in _list_of_objects(model.decide("failures", data), "candidates"):
-            feedback = candidate.get("corrections")
-            current_refs = set(data["current"])
-            if not isinstance(feedback, list) or not any(isinstance(entry, str) and entry in current_refs for entry in feedback):
-                issues.append("Failure requires feedback in the current window")
+    for phase, field in (("tasks", "decisions"), ("failures", "candidates")):
+        pending: deque[tuple[list[Event], list[Event] | None]] = deque(batches)
+        number = 0
+        while pending:
+            current, context = pending.popleft()
+            number += 1
+            prefix = f"{phase} batch {number}: "
+            gaps: list[str] = []
+            nearby = sorted(tasks.values(), key=lambda task: _task_rank(task, current), reverse=True)
+            if len(nearby) > limits.task_limit:
+                gaps.append(f"Task budget omitted {len(nearby) - limits.task_limit} task(s)")
+            nearby = nearby[:limits.task_limit]
+            if phase == "failures" and not nearby:
                 continue
-            row = validate_failure(candidate, tasks, span, event_map)
-            if row is None:
-                issues.append("Failure candidate failed evidence checks")
-            else:
-                rows.append(row)
+            sources = [*(context or []), *current]
+            if phase == "failures" or span.earlier_requests or context is None:
+                sources = [*_previous_evidence(span, sources[0].position, limits, gaps, current), *sources]
+            for task in nearby:
+                if task.request not in sources:
+                    sources.insert(0, task.request)
+            task_options = [task.model_data() for task in nearby]
+            evidence_budget = limits.context_chars
+            if phase == "failures":
+                # Leave room for the top-ranked task even when history fills the window.
+                task_size = len(json.dumps(task_options[0], ensure_ascii=False)) + 4
+                evidence_budget -= min(task_size, evidence_budget // 4)
+            records = _block_data(
+                sources, evidence_budget, event_chars=limits.event_chars,
+                max_events=limits.max_events, gaps=gaps,
+                preferred=frozenset(
+                    [ref(task.request) for task in nearby]
+                    + [ref(event) for event in span.earlier_requests[:1]]
+                ),
+                local_refs=local_refs,
+            )
+            visible = {record["id"] for record in records}
+            current_refs = [ref(event) for event in current if ref(event) in visible]
+            task_records = []
+            remaining = limits.context_chars - len(json.dumps(records, ensure_ascii=False)) - 2
+            for record in task_options:
+                if record["request"] not in visible:
+                    continue
+                size = len(json.dumps(record, ensure_ascii=False)) + 2
+                if size <= remaining:
+                    task_records.append(record)
+                    remaining -= size
+            if len(task_records) < len(nearby):
+                gaps.append(f"Context budget omitted {len(nearby) - len(task_records)} task record(s)")
+            if not current_refs:
+                gaps.append("Budget left no current evidence; model call skipped")
+            elif phase == "failures" and not task_records:
+                gaps.append("Budget left no visible tasks; model call skipped")
+            issues.extend(prefix + gap for gap in gaps)
+            if not current_refs or (phase == "failures" and not task_records):
+                continue
+            event_map = {ref(event): event for event in sources if ref(event) in visible}
+            data = {
+                "current": current_refs,
+                "events": records,
+                "existing_tasks": task_records,
+            }
+            if phase == "tasks" and span.earlier_requests:
+                data["earlier_requests"] = [
+                    ref(event) for event in span.earlier_requests if ref(event) in visible
+                ]
+            if phase == "failures":
+                data["labels"] = LABELS
+            try:
+                answers = _list_of_objects(model.decide(phase, data), field)
+            except ModelInputTooLarge as error:
+                if context:
+                    issues.append(prefix + f"{error}. Replaced previous-block context with bounded lookback")
+                    pending.appendleft((current, None))
+                elif len(current) > 1:
+                    middle = len(current) // 2
+                    issues.append(prefix + f"{error}. Split {len(current)} current events into two batches")
+                    pending.appendleft((current[middle:], None))
+                    pending.appendleft((current[:middle], None))
+                else:
+                    issues.append(prefix + f"{error}. One current event with its context could not fit")
+                continue
+            except ModelError as error:
+                issues.append(prefix + str(error))
+                continue
+            if phase == "tasks":
+                issues.extend(apply_task_decisions(answers, event_map, span.pr.identity, tasks))
+                continue
+
+            for candidate in answers:
+                feedback = candidate.get("corrections")
+                if not isinstance(feedback, list) or not any(
+                    isinstance(entry, str) and entry in current_refs for entry in feedback
+                ):
+                    issues.append("Failure requires feedback in the current window")
+                    continue
+                row = validate_failure(candidate, tasks, span, event_map)
+                if row is None:
+                    issues.append("Failure candidate failed evidence checks")
+                else:
+                    rows.append(row)
     return Analysis(list(tasks.values()), rows, issues)

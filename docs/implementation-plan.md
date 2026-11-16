@@ -59,7 +59,7 @@ scan-history --codex-home "$CODEX_HISTORY_ROOT" --output "$OUTPUT_CSV"
 verify-attempt --output "$OUTPUT_CSV" "$ATTEMPT_ID"
 ```
 
-Repeat `--codex-home` to include copied Codex history roots from other machines. Resolve relative CLI paths from the caller's working directory. Use `--since UTC` to select recent activity. Retain older requests and implementations when recent activity refers to them.
+Repeat `--codex-home` to include copied Codex history roots from other machines. Resolve relative CLI paths from the caller's working directory. `--since UTC` filters candidates by correction time after history has been read. It has no read-selection or model-call budgeting effect.
 
 Publishing and verification require an explicit `--output`. A dry run can omit it. Supply it during a dry run to check proposed rows against an existing CSV. The report shows session IDs, matched turn ranges, match reasons, proposed tasks and rows, and evidence gaps. It makes no writes.
 
@@ -110,6 +110,8 @@ sequenceDiagram
 
 ## Output dataset schema
 
+Keep the current failure labels and CSV columns stable. Version future taxonomy or schema changes and document compatibility before writing the new format.
+
 Use UTF-8 CSV with standard quoting. Each row represents one failed attempt. Multiple corrections to that attempt can support the same row.
 
 | Columns | Contents |
@@ -156,7 +158,9 @@ Derive a new attempt ID from the canonical PR and the earliest supported impleme
 
 A shared file path or overlapping time range can suggest a match. Require supporting evidence before merging. If competing anchors could describe one attempt, report the conflict and defer the new row.
 
-Use recorded event IDs for anchors. If one is absent, use the logical rollout ID and record position. A copied transcript resolves the same anchors at a new path. Recorded worktree paths are lookup hints. If the original worktree cannot be identified locally, leave its snapshot fields blank.
+Use recorded event IDs for ordinary rollout anchors. If one is absent, use the logical rollout ID and record position. For paginated history, derive a page ID from the recorded page prefix and retain the original record position. Join available pages for the same session when their recorded time ranges establish order. A copied transcript resolves the same anchors at a new path. Recorded worktree paths are lookup hints. If the original worktree cannot be identified locally, leave its snapshot fields blank.
+
+Page-aware readers can generate different task and attempt IDs for the same paginated history. This happens when the source anchors change. There is no migration from the old IDs. A replay may add a row under the new ID when the two anchor sets cannot be matched. The writer preserves the values of existing human-verified rows.
 
 ## Implementation Steps
 
@@ -169,7 +173,7 @@ Run the [CUJ acceptance checks](#cuj-acceptance-checks) when each entry point is
 | Task | Scripting | LLM | Independent verification |
 |---|---|---|---|
 | **1A. Normalize transcripts** | Read plain and Zstandard JSONL from the supplied roots. Preserve anchored messages, steering, tool results, and known gaps. Pair calls and results by call ID. | None. | Move a rollout and read both file formats. Compare anchors and event order. Complete a partial record and verify that it is emitted once. |
-| **1B. Resolve PR work spans** | For `--pr`, fetch the PR and match its creation result or commit SHAs against local events. For a backfill, look up PR candidates from transcript evidence. For a commit match, require that the span produced the commit and that the PR contains it. Use observed branch and worktree changes to bound the span. | None. | Match a known PR to two sessions. Verify the session IDs, turn ranges, and match reasons. Reject a bare PR mention or a reused branch alone. |
+| **1B. Resolve PR work spans** | For `--pr`, fetch the PR and match successful publication results or confirmed commit SHAs against local events. For a backfill, look up PR candidates from transcript evidence. Keep evidence together across worktree paths when recorded repository and branch evidence agree. Require a known worktree repository for commit matches. | None. | Match a known PR to two sessions. Verify the session IDs, turn ranges, and match reasons. Reject a bare PR mention, ambiguous publication, and a reused branch alone. |
 
 ### 2. Extract tasks and detect failures
 
@@ -227,6 +231,29 @@ Strict pre-compaction delegation requires Codex runtime integration. Exclude it 
 | **Replay and client checks** | Replay the same evidence offline and through the reviewer result handler. Test the turn trigger on the target client. | Confirm ID reuse and offline recovery after a missed review. Verify that review work cannot trigger another review. |
 
 Use the one-PR evaluation to tune retrieval and model decisions. Use the fixture tests to enforce the rules that code controls.
+
+### Reproduce a private one-PR audit
+
+Run this procedure on the machine with the audit material. Select the editable install's Python, version 3.10 or newer. In `DATASET_CONFIG`, enable the publication adapter used by the audit. Keep the audit inputs and outputs on the validation machine. Use that machine's GitHub and Codex credentials.
+
+Before running the scan, check the two source symlink targets against the paths, sizes, and SHA-256 hashes in `source-files.json`. Use the complete source files. `TRACE_MODEL_COMMAND` should invoke `trace-model.py`, which records requests and responses while calling the real `StructuredModel`. A model-disabled probe cannot validate extraction.
+
+```bash
+"$DATASET_PYTHON" -m unittest discover -s tests -v
+git diff --check
+scan-history --config "$DATASET_CONFIG" --codex-home "$AUDIT_HISTORY_ROOT" --pr "$PR_URL" \
+  --output "$AUDIT_CSV" --model-command "$TRACE_MODEL_COMMAND"
+"$DATASET_PYTHON" "$AUDIT_SCRIPT" "$AUDIT_CSV"
+```
+
+Use a new output path for reproduction. Compare the original prompt, the exact requirement quote, the implementation and correction anchors, event order, and PR evidence. The expected positive is labeled `incorrect_design_decision` with `human_verified=false`. Model wording and additional candidates can vary. Keep traces, source paths, audit reports, and CSVs local.
+
+The other checkout reported 28 passing tests, two published rows, and zero conflicts for one PR and two genuine history pages. Its report retained 144 source-output truncation gaps. The audited positive had complete publication evidence. That run did not exercise full backfill or hook deployment.
+
+### Separate configuration proposals
+
+- Consider config defaults for history roots, session or project selection, and explicit scan or model-call budgets. Keep `--since` documented as a result filter until read selection is implemented.
+- Consider authorized GitHub Enterprise hosts, per-host authenticated API command arguments, and verified repository aliases. Use the same settings for offline scans and hooks. Keep the default GitHub.com and `gh` behavior. Enterprise profiles can be added separately.
 
 ### CUJ acceptance checks
 

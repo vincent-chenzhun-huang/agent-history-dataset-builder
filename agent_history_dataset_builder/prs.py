@@ -9,16 +9,17 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
-from pathlib import Path
-from typing import Protocol
-from urllib.parse import urlsplit
+from pathlib import Path, PurePosixPath
+from typing import NamedTuple, Protocol
+from urllib.parse import unquote, urlsplit
 
+from .config import PUBLICATION_ADAPTERS, PublicationBranchMapping, PublicationFormats
 from .transcripts import Event
 
 
 _PR_URL = re.compile(r"https://([\w.-]+)/([\w.-]+)/([\w.-]+)/pull/([1-9]\d*)")
-_SHA = re.compile(r"[0-9a-f]{7,64}", re.I)
 _COMMIT_RESULT = re.compile(r"^\[[^\r\n\]]+ ([0-9a-f]{7,64})\](?:\s|$)", re.I | re.M)
+_PUBLICATION_REASONS = {"git": "work_commit", "gh": "pr_created"}
 
 
 class GitHubError(ValueError):
@@ -43,20 +44,33 @@ class PullRequest:
     number: int
     commits: frozenset[str]
     repository_id: str = ""
+    head_branch: str | None = None
 
     @property
     def identity(self) -> str:
         return f"{self.repo.host}/{self.repository_id or self.repo.path}/{self.number}"
 
 
+class PublicationEvidence(NamedTuple):
+    reason: str
+    event: Event
+    branch: str | None = None
+    remote_branch: str | None = None
+    branch_mapping: PublicationBranchMapping | None = None
+    adapter: str | None = None
+
+
 @dataclass(frozen=True)
 class WorkSpan:
     events: tuple[Event, ...]
     pr: PullRequest | None = None
-    basis: tuple[tuple[str, Event], ...] = ()
+    basis: tuple[PublicationEvidence, ...] = ()
     issue: str | None = None
     worktree: str | None = None
     worktree_repo: Repo | None = None
+    repository: Repo | None = None
+    has_publication: bool = False
+    earlier_requests: tuple[Event, ...] = ()
 
     @property
     def session_id(self) -> str:
@@ -101,11 +115,11 @@ def parse_repo(remote: object) -> Repo | None:
 class GhPullRequests:
     """Read GitHub using the caller's gh authentication."""
 
-    def __init__(self, additional_host: str | None = None) -> None:
+    def __init__(self, additional_host: str | None = None, *, hosts: tuple[str, ...] = ()) -> None:
         # These caches are per scan and do not write state.
         self.get = lru_cache(maxsize=512)(self.get)
         self.for_commit = lru_cache(maxsize=512)(self.for_commit)
-        self.hosts = {"github.com", additional_host}
+        self.hosts = {"github.com", additional_host, *hosts}
 
     def _api(self, repo: Repo, suffix: str, *, paginate: bool = False) -> object:
         if repo.host not in self.hosts:
@@ -132,12 +146,15 @@ class GhPullRequests:
             raise GitHubError("GitHub returned an unexpected pull request")
         pages = self._api(canonical_repo, f"pulls/{number}/commits?per_page=100", paginate=True)
         commits = {entry["sha"].lower() for page in pages for entry in page if entry.get("sha")}
-        head = data.get("head", {}).get("sha")
+        head_data = data.get("head", {})
+        head = head_data.get("sha")
+        head_branch = head_data.get("ref")
         if isinstance(head, str):
             commits.add(head.lower())
         return PullRequest(
             data["html_url"], canonical_repo, number, frozenset(commits),
             str(data.get("base", {}).get("repo", {}).get("id", "")),
+            head_branch if _branch_name(head_branch) else None,
         )
 
     def for_commit(self, repo: Repo, sha: str) -> tuple[PullRequest, ...]:
@@ -168,7 +185,7 @@ def _native_command(event: Event) -> Command | None:
     if not isinstance(command, str):
         return None
     output = item.get("aggregated_output") or item.get("stdout") or ""
-    return Command(event, command, str(output), item.get("exit_code") == 0, item.get("cwd"))
+    return Command(event, command, str(output), item.get("exit_code") == 0, item.get("cwd") or item.get("workdir"))
 
 
 def _paired_command(event: Event, call: Event) -> Command | None:
@@ -201,14 +218,15 @@ def _paired_command(event: Event, call: Event) -> Command | None:
 
 def _argv(command: str) -> list[str]:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&")
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
         words = list(lexer)
     except ValueError:
         return []
     # A composite command has only one outer exit status.
-    if any(word and all(char in "();<>|&" for char in word) for word in words):
+    if any(word and all(char in "();<>|&\n" for char in word) for word in words):
         return []
     if words and words[0].startswith("/") and Path(words[0]).name in {"gh", "git"}:
         words[0] = Path(words[0]).name
@@ -229,8 +247,47 @@ def _git_target(words: list[str]) -> tuple[list[str], str | None]:
     return words, None
 
 
+def _worktree_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("file:"):
+        try:
+            uri = urlsplit(value)
+            if uri.netloc not in {"", "localhost"} or uri.query or uri.fragment:
+                return None
+            value = unquote(uri.path, errors="strict")
+        except (ValueError, UnicodeError):
+            return None
+        if not value.startswith("/"):
+            return None
+    return os.path.normpath(value) if "\x00" not in value else None
+
+
+def _recorded_argv(text: str) -> list[str]:
+    words = _argv(text.rstrip("\n"))
+    if words:
+        return words
+    # The only accepted command batch is staging followed by one final commit.
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) < 2 or any(char in text for char in ("`", "$", "\\")):
+        return []
+    commands = [_argv(line) for line in lines]
+    if all(_action(argv, "git", "add") and len(argv) > 2 for argv in commands[:-1]):
+        if _action(commands[-1], "git", "commit"):
+            return commands[-1]
+    return []
+
+
+def _branch_name(value: object) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[\w.][\w./-]*", value):
+        return None
+    if value in {"HEAD", "@"} or ".." in value or "//" in value or value.endswith(("/", ".", ".lock")):
+        return None
+    return value.removeprefix("refs/heads/") or None
+
+
 def _branch_change(words: list[str]) -> bool:
-    if _action(words, "git", "switch") or _action(words, "git", "worktree", "add"):
+    if _action(words, "git", "switch"):
         return True
     if _action(words, "gh", "pr", "checkout"):
         return True
@@ -249,6 +306,69 @@ def _repo_option(words: list[str]) -> Repo | None:
         if value:
             return parse_repo("https://" + (value if value.count("/") == 2 else f"github.com/{value}"))
     return None
+
+
+def _git_publication(words: list[str], output: str) -> str | None:
+    match = _COMMIT_RESULT.search(output) if _action(words, "git", "commit") else None
+    return match.group(1).lower() if match else None
+
+
+def _gh_publication(words: list[str], output: str) -> str | None:
+    if not _action(words, "gh", "pr", "create"):
+        return None
+    target = _repo_option(words)
+    urls = [
+        url for line in output.splitlines()
+        if (url := line.strip()) and _PR_URL.fullmatch(url)
+        and (target is None or parse_pr_url(url)[0] == target)
+    ]
+    return urls[0] if len(urls) == 1 else None
+
+
+_STATUS_PR = re.compile(
+    r"^[ \t]*(?:created|updated|published|pushed)[ \t]+(?:pull request|PR)\b"
+    r"(?:[ \t]+#?([1-9]\d*))?[: \t]+"
+    r"(https://[\w.-]+/[\w.-]+/[\w.-]+/pull/[1-9]\d*)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_BRANCH_PR = re.compile(r"^Updating PR for branch (\S+) \[(\S+)\][ \t]*$", re.MULTILINE)
+_NONPUBLICATION = re.compile(
+    r"^[ \t]*(?:usage:|options:|\[?dry[- ]run\b|would\s+(?:push|publish|create|update)\b)"
+    r"|\(dry[- ]run\)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PUBLICATION_MARKERS = re.compile(
+    r"^[ \t]*(?:creat(?:ed|ing)|updat(?:ed|ing)|publish(?:ed|ing)|push(?:ed|ing))"
+    r"[ \t]+(?:PR|pull request)\b", re.IGNORECASE,
+)
+
+
+def _configured_publication(output: str, formats: PublicationFormats) -> tuple[str, str | None] | None:
+    output = output.replace("\r\n", "\n")
+    lines = [line.strip() for line in output.splitlines()]
+    prefixed = [line for line in lines if formats.line_prefix and line.startswith(formats.line_prefix)]
+    marker_lines = set(prefixed)
+    if _NONPUBLICATION.search(output) or sum(
+        line in marker_lines or bool(_PUBLICATION_MARKERS.match(line)) for line in lines
+    ) != 1:
+        return None
+    published = []
+    if "legacy-status" in formats.output_formats:
+        published.extend((url, None) for number, url in _STATUS_PR.findall(output)
+                         if not number or number == url.rsplit("/", 1)[-1])
+    if "branch-update" in formats.output_formats:
+        published.extend((url, branch) for branch_name, url in _BRANCH_PR.findall(output)
+                         if (branch := _branch_name(branch_name)) is not None)
+    if "prefixed-url" in formats.output_formats and prefixed and formats.line_prefix:
+        parts = prefixed[0].removeprefix(formats.line_prefix).split(maxsplit=1)
+        if parts and not (len(parts) == 2 and re.search(r"\bdry[- ]run\b|\bwould\b", parts[1], re.IGNORECASE)):
+            published.append((parts[0], None))
+    if len(published) != 1:
+        return None
+    url, branch = published[0]
+    if not _PR_URL.fullmatch(url) or any(match.group() != url for match in _PR_URL.finditer(output)):
+        return None
+    return url, branch
 
 
 def worktree_snapshot(span: WorkSpan) -> dict[str, str]:
@@ -275,25 +395,57 @@ def worktree_snapshot(span: WorkSpan) -> dict[str, str]:
     return {"recorded_head_sha": head, "recorded_worktree_dirty": str(dirty).lower()}
 
 
+def _confirmed_branch(
+    evidence: PublicationEvidence, url: str, pr: PullRequest,
+    mappings: tuple[PublicationBranchMapping, ...],
+) -> PublicationEvidence:
+    adapter = evidence.adapter
+    if adapter is None:
+        return evidence
+    remote = pr.head_branch
+    if not remote:
+        raise GitHubError("Publication has no attributable PR branch")
+    local = evidence.branch
+    if not local or local == remote:
+        return evidence._replace(branch=local or remote, remote_branch=remote)
+    # The branch rule applies only to the exact authenticated publication repository.
+    if parse_pr_url(url) == (pr.repo, pr.number):
+        repository = f"{pr.repo.owner}/{pr.repo.name}"
+        for mapping in mappings:
+            if (mapping.host, mapping.repository, mapping.adapter) == (pr.repo.host, repository, adapter):
+                if mapping.remote_prefix + local == remote:
+                    return evidence._replace(remote_branch=remote, branch_mapping=mapping)
+    raise GitHubError("Published branch does not match authenticated PR head")
+
+
 def match_spans(
-    events: list[Event], github: PullRequests, selected: PullRequest | None = None
+    events: list[Event], github: PullRequests, selected: PullRequest | None = None, *,
+    adapters: tuple[str, ...] = PUBLICATION_ADAPTERS,
+    formats: dict[str, PublicationFormats] | None = None,
+    branch_mappings: tuple[PublicationBranchMapping, ...] = (),
 ) -> list[WorkSpan]:
     if not events:
         return []
     spans: list[WorkSpan] = []
     pending: list[Event] = []
-    observed: list[tuple[str, Event, Repo | None]] = []
+    observed: list[tuple[str, Repo | None, PublicationEvidence]] = []
+    configured = {name: options for name, options in (formats or {}).items() if name in adapters}
+    publication_commands = {argv: name for name, options in configured.items() for argv in options.argv_variants}
+    branch_commands = {argv for options in configured.values() for argv in options.branch_change_variants}
     calls = {}
     repo: Repo | None = None
     cwd: str | None = None
     branch: str | None = None
     recorded_worktree: str | None = None
     worktree_repos: dict[str, Repo] = {}
+    worktree_branches: dict[str, str] = {}
 
     def boundary(event: Event) -> None:
-        request = next((entry for entry in reversed(pending)
-                        if entry.kind == "user_message" and entry.turn_id == event.turn_id), None)
-        if request is not None and not any(entry.position > request.position for _, entry, _ in observed):
+        request = None
+        if event.turn_id is not None:
+            request = next((entry for entry in reversed(pending)
+                            if entry.kind == "user_message" and entry.turn_id == event.turn_id), None)
+        if request is not None and not any(item.event.position > request.position for _, _, item in observed):
             pending.remove(request)
         else:
             request = None
@@ -302,18 +454,19 @@ def match_spans(
             pending.append(request)
 
     def finish() -> None:
+        nonlocal recorded_worktree
         if not pending:
             return
-        candidates: dict[str, tuple[PullRequest, list[tuple[str, Event]]]] = {}
+        candidates: dict[str, tuple[PullRequest, list[PublicationEvidence]]] = {}
         issue = None
-        for value, evidence, evidence_repo in observed:
+        urls = {parse_pr_url(value) for value, _, _ in observed if value.startswith("https://")}
+        for value, evidence_repo, evidence in observed:
             try:
                 if value.startswith("https://"):
                     if selected is None:
                         prs = (github.get(value),)
                     else:
                         prs = (selected,) if parse_pr_url(value) == parse_pr_url(selected.url) else ()
-                    reason = "pr_created"
                 else:
                     if evidence_repo is None:
                         issue = "A work commit has no recorded GitHub repository"
@@ -324,49 +477,71 @@ def match_spans(
                     else:
                         prs = github.for_commit(evidence_repo, value)
                     prs = tuple(pr for pr in prs if _sha_matches(value, pr))
-                    reason = "work_commit"
             except GitHubError as error:
                 issue = str(error)
                 continue
             for pr in prs:
+                try:
+                    confirmed = _confirmed_branch(evidence, value, pr, branch_mappings)
+                except GitHubError as error:
+                    issue = str(error)
+                    continue
                 _, refs = candidates.setdefault(pr.identity, (pr, []))
-                refs.append((reason, evidence))
-        if len(candidates) == 1:
+                refs.append(confirmed)
+        if len(candidates) == 1 and len(urls) <= 1:
             pr, refs = next(iter(candidates.values()))
             path = recorded_worktree or cwd
             spans.append(WorkSpan(
                 tuple(pending), pr, tuple(refs), worktree=path, worktree_repo=worktree_repos.get(path),
+                repository=repo or pr.repo, has_publication=bool(urls),
             ))
         else:
-            if candidates:
+            if len(candidates) > 1 or len(urls) > 1:
                 issue = "Competing PR matches"
-            spans.append(WorkSpan(tuple(pending), issue=issue or "No confirmed PR evidence"))
+            spans.append(WorkSpan(
+                tuple(pending), issue=issue or "No confirmed PR evidence", repository=repo,
+                has_publication=bool(urls),
+            ))
         pending.clear()
         observed.clear()
+        recorded_worktree = None
 
     for event in events:
         if event.kind == "session_meta":
             raw_git = event.payload.get("git")
+            header_repo = header_branch = None
             if isinstance(raw_git, dict):
-                repo = parse_repo(raw_git.get("repository_url"))
-                branch = raw_git.get("branch")
-            cwd = event.payload.get("cwd")
-            if repo and isinstance(cwd, str):
-                worktree_repos[cwd] = repo
+                header_repo = parse_repo(raw_git.get("repository_url"))
+                header_branch = _branch_name(raw_git.get("branch"))
+                if (repo and header_repo and repo != header_repo) or (branch and header_branch and branch != header_branch):
+                    boundary(event)
+                repo = header_repo or repo
+                branch = header_branch or branch
+            header_cwd = _worktree_path(event.payload.get("cwd"))
+            if header_cwd:
+                cwd = header_cwd
+                if header_repo:
+                    worktree_repos[cwd] = header_repo
+                if header_branch:
+                    worktree_branches[cwd] = header_branch
         if event.kind == "turn_context":
-            turn_cwd = event.payload.get("cwd")
+            turn_cwd = _worktree_path(event.payload.get("cwd"))
             turn_branch = event.payload.get("git", {})
-            turn_branch = turn_branch.get("branch") if isinstance(turn_branch, dict) else None
-            if isinstance(turn_cwd, str) and turn_cwd != cwd:
-                boundary(event)
+            turn_branch = _branch_name(turn_branch.get("branch")) if isinstance(turn_branch, dict) else None
+            if turn_cwd and turn_cwd != cwd:
+                turn_repo = worktree_repos.get(turn_cwd)
+                if turn_repo and repo and turn_repo != repo:
+                    boundary(event)
                 cwd = turn_cwd
-                repo = worktree_repos.get(cwd)
-                branch = None
+                repo = turn_repo or repo
                 recorded_worktree = None
-            if isinstance(turn_branch, str) and branch is not None and turn_branch != branch:
-                boundary(event)
-            if isinstance(turn_branch, str):
+            turn_branch = turn_branch or worktree_branches.get(cwd)
+            if turn_branch:
+                if branch and turn_branch != branch:
+                    boundary(event)
                 branch = turn_branch
+                if cwd:
+                    worktree_branches[cwd] = branch
         command = None
         if event.kind == "tool_call":
             calls[event.anchor] = event
@@ -376,40 +551,52 @@ def match_spans(
             command = _native_command(event)
 
         if command and command.successful:
-            words, explicit_cwd = _git_target(_argv(command.text))
-            command_cwd = explicit_cwd or command.cwd or cwd
-            # Distinct command worktrees partition the event stream too.
-            if isinstance(command_cwd, str) and (
-                (recorded_worktree is not None and recorded_worktree != command_cwd)
-                or (recorded_worktree is None and cwd is not None and cwd != command_cwd)
-            ):
-                boundary(event)
-            if isinstance(command_cwd, str):
-                recorded_worktree = command_cwd
-            command_repo = worktree_repos.get(command_cwd, repo if command_cwd == cwd else None)
+            words, explicit_cwd = _git_target(_recorded_argv(command.text))
+            base_cwd = _worktree_path(command.cwd) if command.cwd else cwd
+            command_cwd = _worktree_path(explicit_cwd) if explicit_cwd else base_cwd
+            if command_cwd and explicit_cwd and base_cwd and not PurePosixPath(command_cwd).is_absolute():
+                command_cwd = os.path.normpath(str(PurePosixPath(base_cwd) / command_cwd))
+            command_repo = worktree_repos.get(command_cwd)
             if _action(words, "git", "remote", "get-url") and not event.output_truncated:
                 discovered = parse_repo(command.output.strip())
                 if discovered is not None:
-                    if command_repo is not None and command_repo != discovered:
-                        finish()
+                    if repo is not None and repo != discovered and command_cwd == cwd:
+                        boundary(event)
                     command_repo = discovered
+                    if command_cwd == cwd:
+                        repo = discovered
                     if isinstance(command_cwd, str):
                         worktree_repos[command_cwd] = discovered
-            if _branch_change(words):
+            if _branch_change(words) or tuple(words) in branch_commands:
                 boundary(event)
-            elif _action(words, "git", "commit"):
-                match = _COMMIT_RESULT.search(command.output)
-                if match:
-                    observed.append((match.group(1).lower(), event, command_repo))
-            elif _action(words, "gh", "pr", "create"):
-                target = _repo_option(words)
-                urls = [
-                    url for line in command.output.splitlines()
-                    if (url := line.strip()) and _PR_URL.fullmatch(url)
-                    and (target is None or parse_pr_url(url)[0] == target)
-                ]
-                if len(urls) == 1:
-                    observed.append((urls[0], event, command_repo))
+                branch = None
+                worktree_branches.pop(command_cwd, None)
+            elif not event.output_truncated and words:
+                adapter = publication_commands.get(tuple(words), words[0])
+                value = published_branch = None
+                if adapter in adapters:
+                    if adapter == "git":
+                        value = _git_publication(words, command.output)
+                    elif adapter == "gh":
+                        value = _gh_publication(words, command.output)
+                    elif tuple(words) in publication_commands:
+                        result = _configured_publication(command.output, configured[adapter])
+                        if result:
+                            value, published_branch = result
+                            command_branch = worktree_branches.get(command_cwd)
+                            if command_branch and published_branch and command_branch != published_branch:
+                                boundary(event)
+                            published_branch = published_branch or command_branch
+                if value:
+                    reason = _PUBLICATION_REASONS.get(adapter, "configured_publication")
+                    if command_repo and repo and command_repo != repo:
+                        boundary(event)
+                        repo = command_repo
+                    recorded_worktree = command_cwd or recorded_worktree
+                    observed.append((value, command_repo, PublicationEvidence(
+                        reason, event, published_branch,
+                        adapter=adapter if reason == "configured_publication" else None,
+                    )))
         pending.append(event)
     finish()
     return spans

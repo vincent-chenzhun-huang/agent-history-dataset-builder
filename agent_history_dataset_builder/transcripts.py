@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 from uuid import UUID
@@ -129,6 +131,76 @@ def discover_rollouts(history_roots: Iterable[Path]) -> Iterator[Path]:
                     if resolved not in seen:
                         seen.add(resolved)
                         yield resolved
+
+
+def page_anchors(events: list[Event]) -> list[Event]:
+    """Assign path-independent anchors to saved pages with reused rollout IDs."""
+    if not events or events[0].payload.get("history_mode") != "paginated":
+        return events
+    header = events[0]
+    first = next((event for event in events[1:] if not event.gap), header)
+    identity = json.dumps(
+        [header.anchor.rollout_id, header.timestamp, first.timestamp, first.kind, first.payload],
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    page_id = "page:" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+    anchors = {
+        event.anchor: replace(event.anchor, rollout_id=page_id, position=event.position)
+        for event in events
+    }
+    return [
+        replace(event, anchor=anchors[event.anchor], call_anchor=anchors.get(event.call_anchor))
+        for event in events
+    ]
+
+
+def _page_bounds(events: list[Event]) -> tuple[datetime, datetime] | None:
+    stamps = []
+    for event in events[1:]:
+        if not event.timestamp:
+            continue
+        try:
+            stamp = datetime.fromisoformat(event.timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if stamp.tzinfo is None:
+            return None
+        stamps.append(stamp)
+    if not stamps or any(first > second for first, second in zip(stamps, stamps[1:])):
+        return None
+    return stamps[0], stamps[-1]
+
+
+def order_pages(pages: list[list[Event]]) -> list[Event] | None:
+    """Join available pages only when their recorded ranges establish order."""
+    if len(pages) == 1:
+        return pages[0]
+    if any(page[0].payload.get("history_mode") != "paginated" for page in pages):
+        return None
+    timed = []
+    for page in pages:
+        bounds = _page_bounds(page)
+        if bounds is None:
+            return None
+        timed.append((bounds, page))
+    timed.sort(key=lambda entry: entry[0])
+    if any(left[0][1] >= right[0][0] for left, right in zip(timed, timed[1:])):
+        return None
+    if len({page[0].anchor.rollout_id for _, page in timed}) != len(timed):
+        return None
+    ordered = []
+    offset = 0
+    calls: dict[str, Anchor] = {}
+    for _, page in timed:
+        for event in page:
+            if event.kind == "tool_call" and event.call_id:
+                calls[event.call_id] = event.anchor
+            call_anchor = event.call_anchor
+            if event.kind == "tool_result" and event.call_id:
+                call_anchor = calls.pop(event.call_id, call_anchor)
+            ordered.append(replace(event, position=event.position + offset, call_anchor=call_anchor))
+        offset += page[-1].position
+    return ordered
 
 
 def read_rollout(
